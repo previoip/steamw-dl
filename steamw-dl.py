@@ -6,16 +6,17 @@ import re
 import urllib.parse
 import requests.exceptions
 from requests import Session
+from requests.structures import CaseInsensitiveDict
 from concurrent.futures import ThreadPoolExecutor
-from io import IOBase
 from queue import Queue
-from collections import namedtuple, defaultdict
+from collections import defaultdict
 from time import time, sleep
 from math import isclose
 from argparse import ArgumentParser
 
 
 class FSCache:
+
   @staticmethod
   def _compile_paths(paths):
     return os.path.join(*map(str, paths))
@@ -42,15 +43,6 @@ class FSCache:
 
 class Timer:
 
-  @staticmethod
-  def fmt_hms(s):
-    m = int(s // 60)
-    h = m // 60
-    s %= 60
-    m %= 60
-    s = int(s)
-    return f'{h: 3d}:{m:02d}:{s:02d}'
-
   def __init__(self):
     self.t0 = time()
     self.ckpt = defaultdict(time)
@@ -66,8 +58,18 @@ class Timer:
       return True
     return False
 
+  @staticmethod
+  def fmt_hms(s):
+    m = int(s // 60)
+    h = m // 60
+    s %= 60
+    m %= 60
+    s = int(s)
+    return f'{h: 3d}:{m:02d}:{s:02d}'
 
-class Speed:
+
+class Speedtally:
+
   def __init__(self, n=10):
     self.n = n
     self.t0 = time()
@@ -80,7 +82,6 @@ class Speed:
     for i in range(self.n):  
       self.deltas[i] = None
       self.values[i] = None
-
 
   def update(self, value):
     t = time()
@@ -106,6 +107,7 @@ class Speed:
 
 
 class BytenumFmt:
+
   unit = ['b', 'kb', 'Mb', 'Gb', 'Tb']
   logs = [1024**i for i in range(len(unit))]
 
@@ -121,13 +123,27 @@ class BytenumFmt:
 
 class ProgressBar:
 
+  def __init__(self):
+    self.fields = list()
+    self.repls = dict()
+    self.sizes = list()
+    self.speeds = list()
+    self.tally = list()
+    self.timer = Timer()
+    self.nents = 0
+    self.status = list()
+    self.rendercounter = 0
+    self.finishedcounter = 0
+    self.flushing = False
+    self.rollcounter = 0
+    self.disable = False
+
   @staticmethod
   def barrepr(frac, n, filla='#', fillb='.'):
     n = max(4, n-2)
     frac = max(min(frac, 1), 0)
     nl = int(round(frac*n, 0))
     nr = max(0, n-nl)
-    # percent = f' {frac: 4.0%}'
     return '[' + filla*nl + fillb*nr + ']'
 
   @staticmethod
@@ -145,25 +161,10 @@ class ProgressBar:
       r = s[:roff%length]
     return (l + r)[:width]
 
-  def __init__(self):
-    self.fields = list()
-    self.repls = dict()
-    self.sizes = list()
-    self.speeds = list()
-    self.tally = list()
-    self.timer = Timer()
-    self.nents = 0
-    self.status = list()
-    self.rendercounter = 0
-    self.finishedcounter = 0
-    self.flushing = False
-    self.rollcounter = 0
-    self.disable = False
-
   def add_entry(self, name, size, repl=None):
     self.fields.append(name)
     self.sizes.append(size)
-    self.speeds.append(Speed(80))
+    self.speeds.append(Speedtally(80))
     self.tally.append(0)
     self.status.append(0)
     self.nents += 1
@@ -195,13 +196,16 @@ class ProgressBar:
     target_size = sum(self.sizes)
     remain_size = target_size - sum(self.tally)
     total_speed = sum(filter(lambda v: v and v>0, map(lambda i: i.get(), self.speeds)))
+
+    lapsed_s = ' elapsed'
+    lapsed_s += f'{Timer.fmt_hms(self.timer.glapsed())}'
     remain_s = ''
     if remain_size > 0 and total_speed > 0:
       remain_s = ' remaining'
       remain_s += Timer.fmt_hms(remain_size/total_speed)
 
     sys.stdout.write('\x1b[2K')
-    sys.stdout.write(f'processing... ({sum(self.status)}/{self.nents}) elapsed{Timer.fmt_hms(self.timer.glapsed())}' + remain_s + '\n')
+    sys.stdout.write(f'processing... ({sum(map(lambda v: v>0, self.status))}/{self.nents}){lapsed_s}{remain_s}\n')
 
     disp_w = 56
     name_w = 14
@@ -236,21 +240,19 @@ class ProgressBar:
 
 
 class downloader:
-  _msgq = Queue(maxsize=1024)
-  _event_terminate = threading.Event()
-  _nt_fileinfo = namedtuple('FileInfo', ['filename', 'filesize'])
-
-  class status:
-    onprogress = 2
-    failed = 1
-    success = 0
 
   @staticmethod
   def _http_head(sess: Session, url):
+    cache_paths = ['cache', 'head-requests', *(urllib.parse.urlparse(url).path.rstrip('/') + '.json').split('/')]
+    cached = FSCache.get(*cache_paths)
+    if cached:
+      return CaseInsensitiveDict(json.loads(cached))
     with sess.head(url, allow_redirects=True) as resp:
       if resp.status_code != 200:
         return {}
-      return resp.headers
+      headers = resp.headers
+    FSCache.set(json.dumps(dict(headers)).encode(), *cache_paths)
+    return headers
 
   @staticmethod
   def _headers_parse_content_length(headers):
@@ -272,145 +274,166 @@ class downloader:
       fname = fname[0]
     return fname.strip().strip('"')
 
-  @classmethod
-  def _http_head_parse_fileinfo(cls, sess, url):
-    headers = cls._http_head(sess, url)
-    filesize = cls._headers_parse_content_length(headers)
-    filename = cls._headers_parse_filename(headers)
-    if filename is None:
-      filename = url.rstrip('/').rpartition('/')[-1]
-    return cls._nt_fileinfo(filename, filesize)
-
-  @classmethod
-  def _streamio(cls, sess: Session, bufp: IOBase, url, trackerid=None, chunk_size=2**18):
-    sums = 0
-    with sess.get(url, stream=True, allow_redirects=True) as resp:
-      if resp.status_code != 200:
-        cls._msgq.put((trackerid, cls.status.failed, (0, 0, f'{resp.status_code}')))
-        return
-      try:
+  @staticmethod
+  def _iterstream(url: str,
+                  session: Session,
+                  status_queue: Queue = None,
+                  terminate_event: threading.Event = None,
+                  trackerid = None,
+                  chunk_size: int = 1024**2,
+                  requests_http_get_kw = {}):
+    queue_ok = not status_queue is None
+    event_ok = not terminate_event is None
+    try:
+      with session.get(url, stream=True, allow_redirects=True, **requests_http_get_kw) as resp:
+        if resp.status_code != 200:
+          if queue_ok: status_queue.put((trackerid, resp.status_code, 0))
+          yield None
+          return
         for chunk in resp.iter_content(chunk_size=chunk_size):
-          if cls._event_terminate.is_set():
-            cls._msgq.put((trackerid, cls.status.failed, (0, sums, f'terminated')))
-            break
-          if chunk:
-            bufp.write(chunk)
-          chunksize = len(chunk)
-          sums += chunksize
-          cls._msgq.put((trackerid, cls.status.onprogress, (chunksize, sums, '')))
-        cls._msgq.put((trackerid, cls.status.success, (0, sums, 'success')))
-        return
-      except requests.exceptions.ChunkedEncodingError:
-        cls._msgq.put((trackerid, cls.status.failed, (0, sums, f'{resp.status_code}')))
-        return
+          if event_ok and terminate_event.is_set(): break
+          if queue_ok: status_queue.put((trackerid, 200, len(chunk)))
+          yield chunk
+        if queue_ok: status_queue.put((trackerid, 0, 0))
+    except requests.exceptions.ChunkedEncodingError:
+      if queue_ok: status_queue.put((trackerid, 418, 0))
+    ...
+    return
 
   @classmethod
-  def _streamfp(cls, sess: Session, path, url, trackerid=None):
-    with open(path, 'wb') as fp:
-      cls._streamio(sess, fp, url, trackerid)
+  def _download_worker(cls,
+                       entry,
+                       session: Session,
+                       status_queue: Queue,
+                       terminate_event: threading.Event,
+                       chunk_size: int = 1024**2,
+                       requests_http_get_kw = {}):
+    url, filepath, _, trackerid = entry
+    if os.path.exists(filepath):
+      status_queue.put((trackerid, 0, 0))
+      return
+    dirname = os.path.dirname(filepath)
+    if not os.path.exists(dirname): os.makedirs(dirname)
+    with open(filepath, 'wb') as fp:
+      for chunk in cls._iterstream(url, session, status_queue, terminate_event,
+                                   trackerid, chunk_size, **requests_http_get_kw):
+        if chunk: fp.write(chunk)
+    return
 
-  @classmethod
-  def _progress_renderer_worker(cls, batch):
-    entries = list(batch.keys())
+  @staticmethod
+  def _tracker_worker(entries,
+                      status_queue: Queue,
+                      terminate_event: threading.Event,
+                      enable_progress_printing=True):
+    pbar = ProgressBar()
+    pbar.disable = not enable_progress_printing
+    timer = Timer()
+    tid_to_key = dict()
+    for url, filepath, filesize, trackerid in entries:
+      pbar.add_entry(url, filesize, repl=os.path.basename(filepath))
+      tid_to_key[trackerid] = url
     n_tasks = len(entries)
     n_tasks_done = 0
-    timer = Timer()
-    pbar = ProgressBar()
 
-    for trackerid in entries:
-      pbar.add_entry(batch[trackerid]['filename'], batch[trackerid]['filesize'])
-
-    timeoutc = 0 
     while n_tasks_done < n_tasks:
-      if cls._event_terminate.is_set():
-        break
-
-      if cls._msgq.qsize() == 0:
-        sleep(.25)
-        pbar.render()
-        timeoutc += 1
-        if timeoutc > 400:
-          break
-        continue
-
-      timeoutc = 0
-      qitem = cls._msgq.get()
-      trackerid, status, progressinfo = qitem
-      if status in (cls.status.failed, cls.status.success):
+      if terminate_event.is_set(): return
+      while status_queue.qsize() == 0:
+        if terminate_event.is_set(): return
+        sleep(.01)
+      status_item = status_queue.get()
+      trackerid, status_code, chunklen = status_item
+      url = tid_to_key[trackerid]
+      if status_code != 200:
         n_tasks_done += 1
-        pbar.set_status_finished(batch[trackerid]['filename'])
-      chunksize, _, _ = progressinfo
-      pbar.update(batch[trackerid]['filename'], chunksize)
+        pbar.set_status_finished(url)
+      elif status_code != 0:
+        pass
+      pbar.update(url, chunklen)
       if not timer.has_lapsed(0, .05): continue
       pbar.render()
     pbar.render()
-
+    terminate_event.set()
 
   @classmethod
-  def _progress_renderer_setup_daemon(cls, batch):
+  def _tracker_thread_setup(cls,
+                            entries,
+                            status_queue: Queue,
+                            terminate_event: threading.Event,
+                            enable_progress_printing=True):
     return threading.Thread(
-      target=cls._progress_renderer_worker,
-      args=(batch,),
+      target=cls._tracker_worker,
+      args=(entries, status_queue, terminate_event, enable_progress_printing),
       daemon=True
     )
 
   @classmethod
-  def _execute(cls, batch, max_workers=4):
-    renderer_daemon = cls._progress_renderer_setup_daemon(batch)
-    renderer_daemon.start()
-    with ThreadPoolExecutor(max_workers=max_workers) as tp:
-      for trackerid in batch:
-        entry = batch[trackerid]
-        tp.submit(cls._streamfp, entry['sess'], entry['filepath'], entry['url'], trackerid)
-      try:
-        while True: sleep(.1)
-      except KeyboardInterrupt:
-        cls._event_terminate.set()
-        print('KeyboardInterrupt: waiting for threads to shutdown')
-    renderer_daemon.join()
+  def preprocess_entries(cls, sess: Session, entries, path, overwrite=True):
+    prepro_entries = list()
+    urldupes = list()
+    for trackerid, item in enumerate(entries):
+      url, filename, filesize = item
+      if url in urldupes: continue # found dupe
+      urldupes.append(url)
 
-  @classmethod
-  def download(cls, sess: Session, path, url, filename=None, filesize=None):
-    batch = dict()
-    if not filename or filesize is None:
-      fileinfo = cls._http_head_parse_fileinfo(sess, url)
-      filename = filename if filename else fileinfo.filename
-      filesize = filesize if filesize else fileinfo.filesize
-    filepath = os.path.join(path, filename)      
-    batch[0] = {'sess':sess, 'url':url, 'filename': filename, 'filesize': filesize, 'filepath': filepath}
-    cls._execute(batch, 1)
-
-  @classmethod
-  def download_batch(cls, sess, path, entries, max_workers=8):
-    batch = dict()
-    for i, (url, filename, filesize) in enumerate(entries):
       if not filename or filesize is None:
-        fileinfo = cls._http_head_parse_fileinfo(sess, url)
-        filename = filename if filename else fileinfo.filename
-        filesize = filesize if filesize else fileinfo.filesize
+        headers = cls._http_head(sess, url)
+        new_filename = cls._headers_parse_filename(headers)
+        filesize = cls._headers_parse_content_length(headers)
+        filename = new_filename if new_filename else os.path.basename(url.rstrip('/'))
       filepath = os.path.join(path, filename)
-      batch[i] = {'sess':sess, 'url':url, 'filename': filename, 'filesize': filesize, 'filepath': filepath}
-    cls._execute(batch, max_workers)
+
+      if not overwrite and os.path.exists(filepath):
+        counter = 0
+        ckfilepath = filepath
+        while os.path.exists(ckfilepath):
+          lfilepath, _, ext = filepath.rpartition('.')
+          if not lfilepath:
+            lfilepath = ext
+            ext = ''
+          if ext: ext = '.'+ext
+          ckfilepath = f'{lfilepath}_{counter}{ext}'
+          counter += 1
+        filepath = ckfilepath
+      prepro_entries.append((url, filepath, filesize, trackerid))
+    return prepro_entries
+
+  @classmethod
+  def download_multiple(cls, session: Session, entries, max_workers=8, enable_progress_printing=True):
+    status_queue = Queue(1024)
+    terminate_event = threading.Event()
+    tracker_daemon = cls._tracker_thread_setup(entries, status_queue, terminate_event, enable_progress_printing)
+    tracker_daemon.start()
+    with ThreadPoolExecutor(max_workers=max_workers) as tp:
+      for entry in entries:
+        tp.submit(cls._download_worker, entry, session, status_queue, terminate_event)
+      try:
+        while not terminate_event.is_set(): sleep(.1)
+      except KeyboardInterrupt:
+        terminate_event.set()
+        print('KeyboardInterrupt: waiting for threads to shutdown')
+    tracker_daemon.join()
+
+  @classmethod
+  def download(cls, session: Session, entry, enable_progress_printing=True):
+    cls.download_multiple(session, [entry], max_workers=1, enable_progress_printing=enable_progress_printing)
 
 
 class swapi:
 
   @staticmethod
   def _post_swapi(sess: Session, interface, method, version, data):
-    cache_path = os.path.join(os.path.dirname(__file__), 'cache', 'swapi-requests', interface, method, version)
+    cache_paths = [os.path.dirname(__file__), 'cache', 'swapi-requests', interface, method, version]
     key = data.get('publishedfileids[0]')
     key = key if key else data.get('publishedfileid')
 
-    cached = FSCache.get(cache_path, key)
+    cached = FSCache.get(*cache_paths, key)
     if cached: return cached
 
-    resp = sess.post(
-      f'https://api.steampowered.com/{interface}/{method}/{version}/', data=data
-    )
+    resp = sess.post(f'https://api.steampowered.com/{interface}/{method}/{version}/', data=data)
     resp.raise_for_status()
     content = resp.content
 
-    FSCache.set(content, cache_path, key)
+    if content: FSCache.set(content, *cache_paths, key)
     return content
 
   @classmethod
@@ -434,23 +457,28 @@ class swapi:
 
 class steamw_dl:
 
+  _traversed = list()
+
   @classmethod
   def get_workshop_info(cls, sess: Session, workshop_id):
     collection_info = swapi.get_collection_details_v1(sess, workshop_id)
     collectiondetails = collection_info['response']['collectiondetails']
     for collection in collectiondetails:
-      workshop_id = int(collection['publishedfileid'])
       if 'children' in collection:
         for collectionchild in collection['children']:
           child_workshop_id = int(collectionchild['publishedfileid'])
           yield from cls.get_workshop_info(sess, child_workshop_id)
       else:
+        workshop_id = int(collection['publishedfileid'])
+        if workshop_id in cls._traversed: continue
+        cls._traversed.append(workshop_id)
         workshop_info = swapi.get_published_file_details_v1(sess, workshop_id)
         yield from workshop_info['response'].get('publishedfiledetails', [])
 
   @classmethod
   def fetch_workshop_id_urls(cls, sess: Session, workshop_ids):
     entries = list()
+    counter = 1
     for workshop_id in workshop_ids:
       for workshop_info in cls.get_workshop_info(sess, workshop_id):
         fileid = workshop_info['publishedfileid']
@@ -465,13 +493,16 @@ class steamw_dl:
           filename = os.path.basename(filename)
         print()
         if fileurl:
-          print(f'- found {appid} {fileid}: "{title}"')
-          print(f'  file : {filename} ({BytenumFmt.fmt(filesize)})')
-          print(f'  url  : {fileurl}')
-          # entries.append((fileurl, filename, filesize))
+          print(f'({counter: 3d}) found {appid} {fileid}: "{title}"')
+          print(f'      file  : {filename} ({BytenumFmt.fmt(filesize)})')
+          print(f'      url   : {fileurl}')
+          print(f'      thumb : {previewurl}')
+          entries.append((fileurl, filename, filesize))
+          counter += 1
         else:
-          print(f'! missing url appid:{appid} wid:{fileid}: {title}')
-          print(f'  file: {filename if filename else "unknown"}')
+          print(f'  !   missing url appid : {appid} wid:{fileid}: {title}')
+          print(f'      file  : {filename if filename else "unknown"}')
+    print()
     return entries
 
 
@@ -488,15 +519,17 @@ if __name__ == '__main__':
     exit()
 
   sess = Session()
+
   entries = list()
   entries.extend(steamw_dl.fetch_workshop_id_urls(sess, args.workshopids))
-
   if len(entries) == 0:
     print('no files to download')
     exit()
 
+  entries = downloader.preprocess_entries(sess, entries, args.path, overwrite=True)
+
   totalsize = 0
-  for _, _, filesize in entries:
+  for _, _, filesize, _ in entries:
     if isinstance(filesize, int):
       totalsize += filesize
 
@@ -506,8 +539,8 @@ if __name__ == '__main__':
   print(f'download location   : {args.path}')
   if input('continue? [Y/n] ') != 'Y': exit()
 
-  max_workers = min(max(1, args.max_workers), 8)
-
   if not os.path.exists(args.path):
     os.makedirs(args.path)
-  downloader.download_batch(sess, args.path, entries, max_workers)
+
+  max_workers = min(max(1, args.max_workers), 8)
+  downloader.download_multiple(sess, entries, max_workers, enable_progress_printing=True)
