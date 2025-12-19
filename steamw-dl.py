@@ -15,7 +15,7 @@ from math import isclose
 from argparse import ArgumentParser
 
 
-class FSCache:
+class fscache:
 
   @staticmethod
   def _compile_paths(paths):
@@ -106,7 +106,7 @@ class Speedtally:
     return sums / count
 
 
-class BytenumFmt:
+class bytenum_fmt:
 
   unit = ['b', 'kb', 'Mb', 'Gb', 'Tb']
   logs = [1024**i for i in range(len(unit))]
@@ -223,8 +223,8 @@ class ProgressBar:
 
       name = self.repls.get(name, name)
       name_s = self.stringroll(name, name_w, self.rollcounter)  + '|'
-      rate_s = f'{BytenumFmt.fmt(rate)}/s'.rjust(rate_w, ' ')
-      sums_s = f'({BytenumFmt.fmt(sums)}) '.rjust(sums_w, ' ')
+      rate_s = f'{bytenum_fmt.fmt(rate)}/s'.rjust(rate_w, ' ')
+      sums_s = f'({bytenum_fmt.fmt(sums)}) '.rjust(sums_w, ' ')
 
       if size == 0:
         pbar_s = ''
@@ -244,14 +244,14 @@ class downloader:
   @staticmethod
   def _http_head(sess: Session, url):
     cache_paths = ['cache', 'head-requests', *(urllib.parse.urlparse(url).path.rstrip('/') + '.json').split('/')]
-    cached = FSCache.get(*cache_paths)
+    cached = fscache.get(*cache_paths)
     if cached:
       return CaseInsensitiveDict(json.loads(cached))
     with sess.head(url, allow_redirects=True) as resp:
       if resp.status_code != 200:
         return {}
       headers = resp.headers
-    FSCache.set(json.dumps(dict(headers)).encode(), *cache_paths)
+    fscache.set(json.dumps(dict(headers)).encode(), *cache_paths)
     return headers
 
   @staticmethod
@@ -426,14 +426,14 @@ class swapi:
     key = data.get('publishedfileids[0]')
     key = key if key else data.get('publishedfileid')
 
-    cached = FSCache.get(*cache_paths, key)
+    cached = fscache.get(*cache_paths, key)
     if cached: return cached
 
     resp = sess.post(f'https://api.steampowered.com/{interface}/{method}/{version}/', data=data)
     resp.raise_for_status()
     content = resp.content
 
-    if content: FSCache.set(content, *cache_paths, key)
+    if content: fscache.set(content, *cache_paths, key)
     return content
 
   @classmethod
@@ -467,11 +467,11 @@ class steamw_dl:
       if 'children' in collection:
         for collectionchild in collection['children']:
           child_workshop_id = int(collectionchild['publishedfileid'])
+          if child_workshop_id in cls._traversed: continue
+          cls._traversed.append(child_workshop_id)
           yield from cls.get_workshop_info(sess, child_workshop_id)
       else:
         workshop_id = int(collection['publishedfileid'])
-        if workshop_id in cls._traversed: continue
-        cls._traversed.append(workshop_id)
         workshop_info = swapi.get_published_file_details_v1(sess, workshop_id)
         yield from workshop_info['response'].get('publishedfiledetails', [])
 
@@ -494,7 +494,7 @@ class steamw_dl:
         print()
         if fileurl:
           print(f'({counter: 3d}) found {appid} {fileid}: "{title}"')
-          print(f'      file  : {filename} ({BytenumFmt.fmt(filesize)})')
+          print(f'      file  : ({bytenum_fmt.fmt(filesize)}) {filename}')
           print(f'      url   : {fileurl}')
           print(f'      thumb : {previewurl}')
           entries.append((fileurl, filename, filesize))
@@ -534,7 +534,7 @@ if __name__ == '__main__':
       totalsize += filesize
 
   print()
-  print(f'total download size : {BytenumFmt.fmt(totalsize)}')
+  print(f'total download size : {bytenum_fmt.fmt(totalsize)}')
   print(f'files to download   : {len(entries)}')
   print(f'download location   : {args.path}')
   if input('continue? [Y/n] ') != 'Y': exit()
@@ -542,5 +542,5 @@ if __name__ == '__main__':
   if not os.path.exists(args.path):
     os.makedirs(args.path)
 
-  max_workers = min(max(1, args.max_workers), 8)
+  max_workers = min(max(1, args.max_workers), 16)
   downloader.download_multiple(sess, entries, max_workers, enable_progress_printing=True)
