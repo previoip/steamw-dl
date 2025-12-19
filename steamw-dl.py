@@ -1,10 +1,11 @@
 import os
 import sys
 import json
-import requests
 import threading
 import re
 import urllib.parse
+import requests.exceptions
+from requests import Session
 from concurrent.futures import ThreadPoolExecutor
 from io import IOBase
 from queue import Queue
@@ -13,6 +14,30 @@ from time import time, sleep
 from math import isclose
 from argparse import ArgumentParser
 
+
+class FSCache:
+  @staticmethod
+  def _compile_paths(paths):
+    return os.path.join(*map(str, paths))
+
+  @classmethod
+  def get(cls, *paths):
+    path = cls._compile_paths(paths)
+    if not os.path.exists(path) and not os.path.isfile(path):
+      return None
+    with open(path, 'rb') as fp:
+      return fp.read()
+
+  @classmethod
+  def set(cls, b, *paths):
+    path = cls._compile_paths(paths)
+    if os.path.exists(path) and os.path.isfile(path):
+      return
+    dirpath = os.path.dirname(path)
+    if not os.path.exists(dirpath) and not os.path.isdir(dirpath):
+      os.makedirs(dirpath)
+    with open(path, 'wb') as fp:
+      return fp.write(b)
 
 
 class Timer:
@@ -81,8 +106,9 @@ class Speed:
 
 
 class BytenumFmt:
-  unit = ['b', 'kb', 'mb', 'gb', 'Tb']
+  unit = ['b', 'kb', 'Mb', 'Gb', 'Tb']
   logs = [1024**i for i in range(len(unit))]
+
   @classmethod
   def fmt(cls, n):
     for i, l in enumerate(cls.logs):
@@ -121,6 +147,7 @@ class ProgressBar:
 
   def __init__(self):
     self.fields = list()
+    self.repls = dict()
     self.sizes = list()
     self.speeds = list()
     self.tally = list()
@@ -133,13 +160,15 @@ class ProgressBar:
     self.rollcounter = 0
     self.disable = False
 
-  def add_entry(self, name, size):
+  def add_entry(self, name, size, repl=None):
     self.fields.append(name)
     self.sizes.append(size)
     self.speeds.append(Speed(80))
     self.tally.append(0)
     self.status.append(0)
     self.nents += 1
+    if repl:
+      self.repls[name] = repl
 
   def update(self, name, incr):
     i = self.fields.index(name)
@@ -147,7 +176,6 @@ class ProgressBar:
     self.speeds[i].update(incr)
     if self.tally[i] == self.sizes[i]:
       self.set_status_finished(name)
-
 
   def set_status_finished(self, name):
     i = self.fields.index(name)
@@ -189,6 +217,7 @@ class ProgressBar:
       sums = self.tally[i]
       rate = self.speeds[i].get()
 
+      name = self.repls.get(name, name)
       name_s = self.stringroll(name, name_w, self.rollcounter)  + '|'
       rate_s = f'{BytenumFmt.fmt(rate)}/s'.rjust(rate_w, ' ')
       sums_s = f'({BytenumFmt.fmt(sums)}) '.rjust(sums_w, ' ')
@@ -217,7 +246,7 @@ class downloader:
     success = 0
 
   @staticmethod
-  def _http_head(sess: requests.Session, url):
+  def _http_head(sess: Session, url):
     with sess.head(url, allow_redirects=True) as resp:
       if resp.status_code != 200:
         return {}
@@ -253,7 +282,7 @@ class downloader:
     return cls._nt_fileinfo(filename, filesize)
 
   @classmethod
-  def _streamio(cls, sess: requests.Session, bufp: IOBase, url, trackerid=None, chunk_size=2**18):
+  def _streamio(cls, sess: Session, bufp: IOBase, url, trackerid=None, chunk_size=2**18):
     sums = 0
     with sess.get(url, stream=True, allow_redirects=True) as resp:
       if resp.status_code != 200:
@@ -276,7 +305,7 @@ class downloader:
         return
 
   @classmethod
-  def _streamfp(cls, sess: requests.Session, path, url, trackerid=None):
+  def _streamfp(cls, sess: Session, path, url, trackerid=None):
     with open(path, 'wb') as fp:
       cls._streamio(sess, fp, url, trackerid)
 
@@ -284,7 +313,7 @@ class downloader:
   def _progress_renderer_worker(cls, batch):
     entries = list(batch.keys())
     n_tasks = len(entries)
-    n_task_done = 0
+    n_tasks_done = 0
     timer = Timer()
     pbar = ProgressBar()
 
@@ -292,7 +321,7 @@ class downloader:
       pbar.add_entry(batch[trackerid]['filename'], batch[trackerid]['filesize'])
 
     timeoutc = 0 
-    while n_task_done < n_tasks:
+    while n_tasks_done < n_tasks:
       if cls._event_terminate.is_set():
         break
 
@@ -300,7 +329,7 @@ class downloader:
         sleep(.25)
         pbar.render()
         timeoutc += 1
-        if timeoutc > 120 * 4:
+        if timeoutc > 400:
           break
         continue
 
@@ -308,7 +337,7 @@ class downloader:
       qitem = cls._msgq.get()
       trackerid, status, progressinfo = qitem
       if status in (cls.status.failed, cls.status.success):
-        n_task_done += 1
+        n_tasks_done += 1
         pbar.set_status_finished(batch[trackerid]['filename'])
       chunksize, _, _ = progressinfo
       pbar.update(batch[trackerid]['filename'], chunksize)
@@ -318,7 +347,7 @@ class downloader:
 
 
   @classmethod
-  def _progress_renderer_getdaemon(cls, batch):
+  def _progress_renderer_setup_daemon(cls, batch):
     return threading.Thread(
       target=cls._progress_renderer_worker,
       args=(batch,),
@@ -327,21 +356,21 @@ class downloader:
 
   @classmethod
   def _execute(cls, batch, max_workers=4):
-    renderer_daemon = cls._progress_renderer_getdaemon(batch)
+    renderer_daemon = cls._progress_renderer_setup_daemon(batch)
     renderer_daemon.start()
-    with ThreadPoolExecutor(max_workers=max_workers) as tpexec:
+    with ThreadPoolExecutor(max_workers=max_workers) as tp:
       for trackerid in batch:
         entry = batch[trackerid]
-        tpexec.submit(cls._streamfp, entry['sess'], entry['filepath'], entry['url'], trackerid)
+        tp.submit(cls._streamfp, entry['sess'], entry['filepath'], entry['url'], trackerid)
       try:
         while True: sleep(.1)
       except KeyboardInterrupt:
         cls._event_terminate.set()
-        print('KeyboardInterrupt: waiting for thread to shutdown')
+        print('KeyboardInterrupt: waiting for threads to shutdown')
     renderer_daemon.join()
 
   @classmethod
-  def download(cls, sess: requests.Session, path, url, filename=None, filesize=None):
+  def download(cls, sess: Session, path, url, filename=None, filesize=None):
     batch = dict()
     if not filename or filesize is None:
       fileinfo = cls._http_head_parse_fileinfo(sess, url)
@@ -350,7 +379,6 @@ class downloader:
     filepath = os.path.join(path, filename)      
     batch[0] = {'sess':sess, 'url':url, 'filename': filename, 'filesize': filesize, 'filepath': filepath}
     cls._execute(batch, 1)
-
 
   @classmethod
   def download_batch(cls, sess, path, entries, max_workers=8):
@@ -368,16 +396,13 @@ class downloader:
 class swapi:
 
   @staticmethod
-  def _post(sess: requests.Session, interface, method, version, data):
+  def _post_swapi(sess: Session, interface, method, version, data):
     cache_path = os.path.join(os.path.dirname(__file__), 'cache', 'swapi-requests', interface, method, version)
-    if not os.path.exists(cache_path):
-      os.makedirs(cache_path)
     key = data.get('publishedfileids[0]')
     key = key if key else data.get('publishedfileid')
-    cache_filepath = os.path.join(cache_path, str(key))
-    if key and os.path.exists(cache_filepath):
-      with open(cache_filepath, 'rb') as fp:
-        return fp.read()
+
+    cached = FSCache.get(cache_path, key)
+    if cached: return cached
 
     resp = sess.post(
       f'https://api.steampowered.com/{interface}/{method}/{version}/', data=data
@@ -385,35 +410,32 @@ class swapi:
     resp.raise_for_status()
     content = resp.content
 
-    if key and not os.path.exists(cache_filepath):
-      with open(cache_filepath, 'wb') as fp:
-        fp.write(content)
-
+    FSCache.set(content, cache_path, key)
     return content
 
   @classmethod
-  def get_collection_details_v1(cls, sess: requests.Session, publishedfileid: int):
+  def get_collection_details_v1(cls, sess: Session, publishedfileid: int):
     interf = 'ISteamRemoteStorage'
     method = 'GetCollectionDetails'
     version = 'v1'
-    content = cls._post(sess, interf, method, version,
-                        {'collectioncount':1, 'publishedfileids[0]': publishedfileid})
+    content = cls._post_swapi(sess, interf, method, version,
+                              {'collectioncount':1, 'publishedfileids[0]': publishedfileid})
     return json.loads(content)
 
   @classmethod
-  def get_published_file_details_v1(cls, sess: requests.Session, publishedfileid: int):
+  def get_published_file_details_v1(cls, sess: Session, publishedfileid: int):
     interf = 'ISteamRemoteStorage'
     method = 'GetPublishedFileDetails'
     version = 'v1'
-    content = cls._post(sess, interf, method, version,
-                        {'itemcount':1, 'publishedfileids[0]': publishedfileid})
+    content = cls._post_swapi(sess, interf, method, version,
+                              {'itemcount':1, 'publishedfileids[0]': publishedfileid})
     return json.loads(content)
 
 
 class steamw_dl:
 
   @classmethod
-  def get_workshop_info(cls, sess, workshop_id):
+  def get_workshop_info(cls, sess: Session, workshop_id):
     collection_info = swapi.get_collection_details_v1(sess, workshop_id)
     collectiondetails = collection_info['response']['collectiondetails']
     for collection in collectiondetails:
@@ -427,7 +449,7 @@ class steamw_dl:
         yield from workshop_info['response'].get('publishedfiledetails', [])
 
   @classmethod
-  def fetch_workshop_id_urls(cls, sess: requests.Session, workshop_ids):
+  def fetch_workshop_id_urls(cls, sess: Session, workshop_ids):
     entries = list()
     for workshop_id in workshop_ids:
       for workshop_info in cls.get_workshop_info(sess, workshop_id):
@@ -437,8 +459,8 @@ class steamw_dl:
         filename = workshop_info.get('filename',  '')
         filesize = int(workshop_info.get('file_size',  0))  
         fileurl = workshop_info.get('file_url',  '')
-        # previewurl = workshop_info.get('preview_url',  '')
-        # if previewurl: urls.append((previewurl, None, None))
+        previewurl = workshop_info.get('preview_url',  '')
+        if previewurl: entries.append((previewurl, None, None))
         if filename:
           filename = os.path.basename(filename)
         print()
@@ -446,11 +468,10 @@ class steamw_dl:
           print(f'- found {appid} {fileid}: "{title}"')
           print(f'  file : {filename} ({BytenumFmt.fmt(filesize)})')
           print(f'  url  : {fileurl}')
-          entries.append((fileurl, filename, filesize))
+          # entries.append((fileurl, filename, filesize))
         else:
           print(f'! missing url appid:{appid} wid:{fileid}: {title}')
           print(f'  file: {filename if filename else "unknown"}')
-          continue
     return entries
 
 
@@ -466,7 +487,7 @@ if __name__ == '__main__':
     parser.print_help()
     exit()
 
-  sess = requests.Session()
+  sess = Session()
   entries = list()
   entries.extend(steamw_dl.fetch_workshop_id_urls(sess, args.workshopids))
 
@@ -476,7 +497,8 @@ if __name__ == '__main__':
 
   totalsize = 0
   for _, _, filesize in entries:
-    totalsize += filesize
+    if isinstance(filesize, int):
+      totalsize += filesize
 
   print()
   print(f'total download size : {BytenumFmt.fmt(totalsize)}')
