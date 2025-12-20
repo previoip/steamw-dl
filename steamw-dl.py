@@ -15,6 +15,8 @@ from math import isclose
 from argparse import ArgumentParser
 
 
+pwd = os.path.dirname(__file__)
+
 class fscache:
 
   @staticmethod
@@ -243,7 +245,7 @@ class downloader:
 
   @staticmethod
   def _http_head(sess: Session, url):
-    cache_paths = ['cache', 'head-requests', *(urllib.parse.urlparse(url).path.rstrip('/') + '.json').split('/')]
+    cache_paths = [pwd, 'cache', 'head-requests', *(urllib.parse.urlparse(url).path.rstrip('/') + '.json').split('/')]
     cached = fscache.get(*cache_paths)
     if cached:
       return CaseInsensitiveDict(json.loads(cached))
@@ -422,7 +424,7 @@ class swapi:
 
   @staticmethod
   def _post_swapi(sess: Session, interface, method, version, data):
-    cache_paths = [os.path.dirname(__file__), 'cache', 'swapi-requests', interface, method, version]
+    cache_paths = [pwd, 'cache', 'swapi-requests', interface, method, version]
     key = data.get('publishedfileids[0]')
     key = key if key else data.get('publishedfileid')
 
